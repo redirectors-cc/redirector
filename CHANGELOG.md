@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Instant redirect mode** — when `interstitial.delay_seconds` is set to `0`, the server returns an HTTP 307 redirect directly to the target URL, bypassing the interstitial page entirely while still collecting analytics
 
+### Fixed
+
+- Removed hardcoded `ENV CONFIG_PATH=/app/config.yaml` from Dockerfile that prevented env-var-only deployments (e.g. Railway) from starting
+
 ## [0.1.0] - 2026-02-06
 
 ### Added
