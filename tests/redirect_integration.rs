@@ -12,6 +12,14 @@ async fn setup_services(
     redis_port: u16,
     postgres_port: u16,
 ) -> Arc<RedirectState<HashidService, CacheService, MainStorage>> {
+    setup_services_with_delay(redis_port, postgres_port, 5).await
+}
+
+async fn setup_services_with_delay(
+    redis_port: u16,
+    postgres_port: u16,
+    delay_seconds: u32,
+) -> Arc<RedirectState<HashidService, CacheService, MainStorage>> {
     let hashid_config = HashidsConfig {
         salts: vec!["test_salt".to_string()],
         min_length: 6,
@@ -49,7 +57,7 @@ async fn setup_services(
 
     Arc::new(RedirectState {
         resolver: url_resolver,
-        delay_seconds: 5,
+        delay_seconds,
         dispatcher: redirector::events::dispatcher::EventDispatcher::noop(),
     })
 }
@@ -413,6 +421,79 @@ async fn test_redirect_interstitial_contains_countdown() {
     // Check interstitial page elements
     assert!(body_str.contains("countdown") || body_str.contains("Countdown"));
     assert!(body_str.contains("5")); // delay_seconds
+}
+
+#[tokio::test]
+async fn test_redirect_zero_delay_returns_302() {
+    // Start Redis
+    let redis = Redis::default()
+        .start()
+        .await
+        .expect("Failed to start Redis");
+    let redis_port = redis.get_host_port_ipv4(6379).await.unwrap();
+
+    // Start Postgres with test data
+    let postgres = Postgres::default()
+        .with_db_name("redirector")
+        .with_user("redirector")
+        .with_password("password")
+        .start()
+        .await
+        .expect("Failed to start Postgres");
+    let postgres_port = postgres.get_host_port_ipv4(5432).await.unwrap();
+
+    // Create schema and insert test data
+    let db_url = format!(
+        "postgres://redirector:password@localhost:{}/redirector",
+        postgres_port
+    );
+    let pool = sqlx::PgPool::connect(&db_url)
+        .await
+        .expect("Failed to connect to Postgres");
+
+    setup_database(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO dictionary.urls (id, name) VALUES (1, 'https://instant.example.com/target')",
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to insert data");
+
+    // Setup services with delay_seconds = 0
+    let state = setup_services_with_delay(redis_port, postgres_port, 0).await;
+    let app = create_app(state);
+
+    // Encode ID 1
+    let hashids = harsh::Harsh::builder()
+        .salt("test_salt")
+        .length(6)
+        .build()
+        .unwrap();
+    let hashid = hashids.encode(&[1]);
+
+    // Make request
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/r/{}", hashid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("Failed to make request");
+
+    // Should return 307 Temporary Redirect, not 200 with interstitial
+    assert_eq!(response.status(), 307);
+
+    // Location header should point to target URL
+    let location = response
+        .headers()
+        .get("location")
+        .expect("Missing Location header")
+        .to_str()
+        .unwrap();
+    assert_eq!(location, "https://instant.example.com/target");
 }
 
 #[tokio::test]
