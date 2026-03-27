@@ -6,7 +6,7 @@ use askama::Template;
 use axum::{
     extract::{Path, State},
     http::HeaderMap,
-    response::Html,
+    response::{Html, IntoResponse, Redirect, Response},
 };
 use std::sync::Arc;
 use std::time::Instant;
@@ -38,7 +38,7 @@ pub async fn redirect_handler<H, C, S>(
     State(state): State<Arc<RedirectState<H, C, S>>>,
     Path(hashid): Path<String>,
     headers: HeaderMap,
-) -> Result<Html<String>, AppError>
+) -> Result<Response, AppError>
 where
     H: HashidDecoder + 'static,
     C: Cache + 'static,
@@ -76,17 +76,23 @@ where
                 ip: extract_client_ip(&headers),
             });
 
-            let template = InterstitialTemplate {
-                target_url: resolved.full_url,
-                target_domain: resolved.domain,
-                delay_seconds: state.delay_seconds,
-            };
+            // Direct HTTP redirect when delay is 0, otherwise show interstitial page
+            if state.delay_seconds == 0 {
+                Ok(Redirect::temporary(&resolved.full_url).into_response())
+            } else {
+                let template = InterstitialTemplate {
+                    target_url: resolved.full_url,
+                    target_domain: resolved.domain,
+                    delay_seconds: state.delay_seconds,
+                };
 
-            Ok(Html(crate::minify_html_str(
-                &template
-                    .render()
-                    .map_err(|e| AppError::Internal(e.into()))?,
-            )))
+                Ok(Html(crate::minify_html_str(
+                    &template
+                        .render()
+                        .map_err(|e| AppError::Internal(e.into()))?,
+                ))
+                .into_response())
+            }
         }
         Err(AppError::NotFound | AppError::InvalidHashid) => {
             tracing::info!(hashid = %hashid, "URL not found");
