@@ -84,8 +84,14 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_load_from_base64_valid() {
         use base64::Engine;
+
+        // Clean REDIRECTOR__* env vars that config crate would merge on top of YAML
+        let mut guard = EnvGuard::new();
+        guard.remove("REDIRECTOR__HASHIDS__SALTS__0");
+        guard.remove("REDIRECTOR__SERVER__PORT");
 
         let yaml = r#"
 server:
