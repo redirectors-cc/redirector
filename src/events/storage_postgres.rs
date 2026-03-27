@@ -9,6 +9,7 @@ use std::net::IpAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
+use super::snowflake::{create_generator, SnowflakeGenerator};
 use super::traits::EventStorage;
 use super::{DataSource, EventBatch};
 use crate::config::EventsConfig;
@@ -62,17 +63,23 @@ trait EntityResolver: Send + Sync {
     /// Layer 2: Search — SELECT id by key.
     async fn find(&self, conn: &mut PgConnection, key: &Self::Key) -> anyhow::Result<Option<i64>>;
 
-    /// Layer 3: Persist — INSERT ON CONFLICT DO NOTHING RETURNING id.
-    async fn insert(&self, conn: &mut PgConnection, key: &Self::Key)
-        -> anyhow::Result<Option<i64>>;
+    /// Layer 3: Persist — INSERT with application-generated Snowflake ID.
+    /// ON CONFLICT DO NOTHING RETURNING id.
+    async fn insert(
+        &self,
+        conn: &mut PgConnection,
+        id: i64,
+        key: &Self::Key,
+    ) -> anyhow::Result<Option<i64>>;
 }
 
 /// Resolve raw input to reference table ID via 3-step pattern:
-/// find → insert → fallback find.
+/// find → insert (with Snowflake ID) → fallback find.
 /// Monomorphized per resolver type — zero runtime overhead.
 async fn resolve_or_create<R: EntityResolver>(
     resolver: &R,
     conn: &mut PgConnection,
+    snowflake: &SnowflakeGenerator,
     raw: Option<&str>,
 ) -> anyhow::Result<i64> {
     let key = match raw.and_then(|v| resolver.prepare(v)) {
@@ -83,7 +90,8 @@ async fn resolve_or_create<R: EntityResolver>(
     if let Some(id) = resolver.find(conn, &key).await? {
         return Ok(id);
     }
-    if let Some(id) = resolver.insert(conn, &key).await? {
+    let new_id = snowflake.generate();
+    if let Some(id) = resolver.insert(conn, new_id, &key).await? {
         return Ok(id);
     }
     // Race condition fallback
@@ -119,12 +127,14 @@ impl EntityResolver for RefererResolver {
     async fn insert(
         &self,
         conn: &mut PgConnection,
+        id: i64,
         key: &Self::Key,
     ) -> anyhow::Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO referers (hash, value) VALUES ($1, $2) \
+            "INSERT INTO referers (id, hash, value) VALUES ($1, $2, $3) \
              ON CONFLICT (hash) DO NOTHING RETURNING id",
         )
+        .bind(id)
         .bind(&key.hash)
         .bind(&key.value)
         .fetch_optional(&mut *conn)
@@ -176,13 +186,15 @@ impl EntityResolver for UserAgentResolver {
     async fn insert(
         &self,
         conn: &mut PgConnection,
+        id: i64,
         key: &Self::Key,
     ) -> anyhow::Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO user_agents (hash, value, browser, browser_version, os, device_type) \
-             VALUES ($1, $2, $3, $4, $5, $6) \
+            "INSERT INTO user_agents (id, hash, value, browser, browser_version, os, device_type) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7) \
              ON CONFLICT (hash) DO NOTHING RETURNING id",
         )
+        .bind(id)
         .bind(&key.hash)
         .bind(&key.value)
         .bind(&key.browser)
@@ -221,12 +233,14 @@ impl EntityResolver for RefererDomainResolver {
     async fn insert(
         &self,
         conn: &mut PgConnection,
+        id: i64,
         key: &Self::Key,
     ) -> anyhow::Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO referer_domains (domain) VALUES ($1) \
+            "INSERT INTO referer_domains (id, domain) VALUES ($1, $2) \
              ON CONFLICT (domain) DO NOTHING RETURNING id",
         )
+        .bind(id)
         .bind(&key.domain)
         .fetch_optional(&mut *conn)
         .await?;
@@ -358,12 +372,14 @@ impl EntityResolver for GeoLocationResolver {
     async fn insert(
         &self,
         conn: &mut PgConnection,
+        id: i64,
         key: &Self::Key,
     ) -> anyhow::Result<Option<i64>> {
         let row: Option<(i64,)> = sqlx::query_as(
-            "INSERT INTO geo_locations (country_code, city) VALUES ($1, $2) \
+            "INSERT INTO geo_locations (id, country_code, city) VALUES ($1, $2, $3) \
              ON CONFLICT (country_code, city) DO NOTHING RETURNING id",
         )
+        .bind(id)
         .bind(&key.country_code)
         .bind(&key.city)
         .fetch_optional(&mut *conn)
@@ -440,9 +456,11 @@ async fn ensure_url(conn: &mut PgConnection, url_id: i64, url: &str) -> anyhow::
     Ok(())
 }
 
-/// Insert a single redirect event row.
+/// Insert a single redirect event row with Snowflake ID.
+#[allow(clippy::too_many_arguments)]
 async fn insert_event(
     conn: &mut PgConnection,
+    event_id: i64,
     event: &super::RedirectEvent,
     referer_id: i64,
     user_agent_id: i64,
@@ -462,11 +480,12 @@ async fn insert_event(
 
     sqlx::query(
         "INSERT INTO redirect_events \
-         (url_id, event_timestamp, latency_micros, source, \
+         (id, url_id, event_timestamp, latency_micros, source, \
           referer_id, user_agent_id, referer_domain_id, geo_location_id, \
           ip, batch_id) \
-         VALUES ($1, $2, $3, $4::data_source, $5, $6, $7, $8, $9::inet, $10)",
+         VALUES ($1, $2, $3, $4, $5::data_source, $6, $7, $8, $9, $10::inet, $11)",
     )
+    .bind(event_id)
     .bind(event.url_id)
     .bind(event.timestamp)
     .bind(event.latency_micros as i64)
@@ -488,6 +507,7 @@ async fn insert_event(
 pub struct PostgresEventStorage {
     pool: PgPool,
     partitions: PartitionManager,
+    snowflake: SnowflakeGenerator,
     referers: RefererResolver,
     user_agents: UserAgentResolver,
     referer_domains: RefererDomainResolver,
@@ -520,6 +540,7 @@ impl PostgresEventStorage {
         Ok(Self {
             pool,
             partitions: PartitionManager::new(),
+            snowflake: create_generator(1),
             referers: RefererResolver,
             user_agents: UserAgentResolver {
                 parser: woothee::parser::Parser::new(),
@@ -581,19 +602,41 @@ impl PostgresEventStorage {
             ensure_url(&mut tx, event.url_id, &event.target_url).await?;
         }
 
-        // Resolve references + insert events
+        // Resolve references + insert events (all IDs via Snowflake)
         for event in events {
-            let referer_id =
-                resolve_or_create(&self.referers, &mut tx, event.referer.as_deref()).await?;
-            let user_agent_id =
-                resolve_or_create(&self.user_agents, &mut tx, event.user_agent.as_deref()).await?;
-            let referer_domain_id =
-                resolve_or_create(&self.referer_domains, &mut tx, event.referer.as_deref()).await?;
-            let geo_location_id =
-                resolve_or_create(&self.geo_locations, &mut tx, event.ip.as_deref()).await?;
+            let referer_id = resolve_or_create(
+                &self.referers,
+                &mut tx,
+                &self.snowflake,
+                event.referer.as_deref(),
+            )
+            .await?;
+            let user_agent_id = resolve_or_create(
+                &self.user_agents,
+                &mut tx,
+                &self.snowflake,
+                event.user_agent.as_deref(),
+            )
+            .await?;
+            let referer_domain_id = resolve_or_create(
+                &self.referer_domains,
+                &mut tx,
+                &self.snowflake,
+                event.referer.as_deref(),
+            )
+            .await?;
+            let geo_location_id = resolve_or_create(
+                &self.geo_locations,
+                &mut tx,
+                &self.snowflake,
+                event.ip.as_deref(),
+            )
+            .await?;
 
+            let event_id = self.snowflake.generate();
             insert_event(
                 &mut tx,
+                event_id,
                 event,
                 referer_id,
                 user_agent_id,
