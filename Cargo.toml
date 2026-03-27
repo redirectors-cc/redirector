@@ -1,6 +1,6 @@
 [package]
 name = "redirector"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 authors = ["Anton Brilliantov"]
 description = "Safe redirect service with hashid decoding and caching"
