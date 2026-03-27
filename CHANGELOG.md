@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.2] - 2026-03-27
+
+### Added
+
+- **Instant redirect mode** — when `interstitial.delay_seconds` is set to `0`, the server returns an HTTP 307 redirect directly to the target URL, bypassing the interstitial page entirely while still collecting analytics
+
 ## [0.1.0] - 2026-02-06
 
 ### Added
@@ -73,4 +79,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - CI/CD with coverage and performance badges
   - 18 language translations for documentation
 
-[0.1.0]: https://github.com/brilliant-almazov/redirector/releases/tag/v0.1.0
+[0.1.2]: https://github.com/redirectors-cc/redirector/releases/tag/v0.1.2
+[0.1.0]: https://github.com/redirectors-cc/redirector/releases/tag/v0.1.0
